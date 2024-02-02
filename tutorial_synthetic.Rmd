@@ -1,0 +1,353 @@
+---
+title: "Tutorial of group-based SHAP"
+author: "Jeremy Rohmer"
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(fig.width = 8.83)
+```
+
+------------------------------------------------------------------------
+
+# Introduction
+
+This tutorial shows an example of how to apply the group-based SHAP approach to decompose the prediction uncertainty.
+The data are based on the vignette of the R package [CAST](https://hannameyer.github.io/CAST/articles/cast02-AOA-tutorial.html).
+
+### Getting started
+
+```{r, message = FALSE, warning=FALSE}
+library(terra)## spatial analysis
+library(viridis)##color
+library(sf)##for spatial analysis
+library(corrplot)##for matrix of pairwise coefficients
+library(cluster)## for PAM clustering
+library(sensitivity)##for HSIC-based analysis
+library(ranger)##for qRF training
+library(shapr)## for SHAP
+library(gridExtra)
+library(ggplot2)
+
+rm(list=ls())
+
+set.seed(12345)
+
+```
+
+## Step 0. Get data
+
+### Generate Predictors
+
+As predictor variables, a set of bioclimatic variables are used (<https://www.worldclim.org>).
+
+```{r, message = FALSE, warning=FALSE}
+predictors <- rast("bioclim.tif")
+
+## normalisation between 0 and 1
+for (i in 1:length(names(predictors))){
+	v = values(predictors[[i]])
+	values(predictors[[i]]) = (v - min(v,na.rm=T)) / (max(v,na.rm=T) - min(v,na.rm=T))
+}
+
+plot(predictors,col=viridis(100))
+```
+
+### Generate Response
+
+To be able to test the reliability of the method, we are using a simulated prediction task.
+We therefore simulate a virtual response variable from the bioclimatic variables.
+
+```{r,message = FALSE, warning=FALSE}
+response <- 10*predictors$bio2+5*predictors$bio5+5*predictors$bio10+5*predictors$bio13+
+		0.0001*predictors$bio14+0.0001*predictors$bio19
+names(response) = "response"
+plot(response,col=viridis(100),main="virtual response")
+```
+
+### Simulate sampling locations
+
+To simulate a typical prediction task, locations are randomly selected. Here, we randomly select 50 points.
+
+```{r,message = FALSE, warning=FALSE}
+mask <- predictors[[1]]
+values(mask)[!is.na(values(mask))] <- 1
+mask <- st_as_sf(as.polygons(mask))
+mask <- st_make_valid(mask)
+```
+
+```{r,message = FALSE, warning=FALSE}
+samplepoints <- st_as_sf(st_sample(mask,25,"random"))
+xy0 = st_coordinates(samplepoints)##coordinates
+plot(response,col=viridis(100))
+plot(samplepoints,col="red",add=T,pch=3)
+```
+
+### Prepare data
+
+Then, predictors and response are extracted for the sampling locations.
+
+```{r,message = FALSE, warning=FALSE}
+trainDat <- terra::extract(predictors,samplepoints,na.rm=FALSE)
+trainDat$response <- unlist(terra::extract(response,samplepoints,na.rm=FALSE, ID=FALSE))
+trainDat <- na.omit(trainDat)
+trainDat <- trainDat[,-1]
+x_train = trainDat[,-c(ncol(trainDat))]
+```
+
+We also extract the test data at a series of grid points over the study area. Here, we use *N*=100, but a larger number can be used.
+
+```{r,message = FALSE, warning=FALSE}
+N = 100
+gridpoints <- st_as_sf(st_sample(mask,N,type="regular"))
+xy = st_coordinates(gridpoints)##coordinates
+plot(response,col=viridis(100))
+plot(gridpoints,col="red",add=T,pch=3)
+
+testDat <- terra::extract(predictors,gridpoints,na.rm=FALSE)
+testDat$response <- unlist(terra::extract(response,gridpoints,na.rm=FALSE, ID=FALSE))
+testDat <- na.omit(testDat)
+testDat <- testDat[,-1]
+x_test = testDat[,-ncol(testDat)]
+```
+
+## Step 1. Screening analysis
+
+HSIC-based screening analysis is applied. The following figure gives the p-value.
+Recall that a p-value superior to 5% suggests that the corresponding covariate is non-influential. By construction, the two last variables, *bio14* and *bio19*, have negligible influence, which is here confirmed.
+
+```{r,message = FALSE, warning=FALSE}
+sensi <- sensiHSIC(model=NULL, X = data.frame(x_train),
+					kernelX=c(rep("rbf",ncol(x_train))), 
+					kernelY="rbf"
+					)
+ss = tell(sensi, y=data.frame(trainDat$response))
+test.perm <- testHSIC(ss, test.method="Seq_Permutation",seq.options = list(criterion = "screening",alpha = 0.05,graph = FALSE))
+barplot(t(unlist(test.perm$pval)),names.arg=names(x_train),las=2,horiz=T,angle=90,xlab="p-value")
+abline(v=0.05,col=2,lwd=4)
+```
+
+we filter out the non-influential covariates (p-value \> 5%).
+
+```{r,message = FALSE, warning=FALSE}
+filtre = which(test.perm$pval<0.05)
+x_train = x_train[,filtre]
+x_test = x_test[,filtre]
+```
+
+## Step 2. Train the qRF model
+
+Quantile random Forest is applied here as machine learning algorithm (others can be used as well, as long as prediction uncertainty is estimated). The prediction uncertainty is measured here by the inter-quartile width.
+
+```{r,message = FALSE, warning=FALSE}
+df.tr = data.frame(
+  X = x_train,
+  Y = trainDat$response
+)
+names(df.tr) = c(names(x_train),"Y")
+df.tr = na.omit(df.tr)
+
+model <- ranger(
+  formula = Y~., 
+  data = df.tr,
+  num.trees = 1000,
+  mtry=3,
+  min.node.size = 5,
+  respect.unordered.factors = FALSE,
+  quantreg = TRUE
+)
+print(model)
+
+modelM <- ranger(
+  formula = Y~., 
+  data = df.tr,
+  num.trees = 1000,
+  mtry=3,
+  min.node.size = 5,
+  respect.unordered.factors = FALSE
+)
+print(modelM)
+
+## mean prediction
+PRED = predict(modelM,x_test)
+##quartile prediction
+PREDQ = predict(model,x_test,type = "quantiles", quantiles = c(.25,.75))
+
+```
+
+We plot the true values, the predictions and the uncertainty.
+
+```{r,message = FALSE, warning=FALSE}
+df.plt50 = data.frame(X = xy[,1],Y = xy[,2],Pred = PREDQ$predictions[,2]- PREDQ$predictions[,1])
+plt.unc =  ggplot(df.plt50,aes(X,Y,color=Pred)) + 
+	geom_point(size=1,shape=15)+xlab("X-coordinate [m]")+ylab("Y-coordinate [m]")+
+	scale_colour_viridis_c(limits=c(0,5))+theme_bw()+
+	guides(size = guide_legend(order=2))+ggtitle("(c)")
+
+df.plt = data.frame(X = xy[,1],Y = xy[,2],Pred = PRED$predictions)
+plt.mean =  ggplot(df.plt,aes(X,Y,color=Pred)) + 
+	geom_point(size=1,shape=15)+xlab("X-coordinate [m]")+ylab("Y-coordinate [m]")+
+	scale_colour_viridis_c(limits=c(3,24))+theme_bw()+
+	guides(size = guide_legend(order=2))+ggtitle("(b)")
+
+df.plt = data.frame(X = xy[,1],Y = xy[,2],Pred = testDat$response)
+plt.true =  ggplot(df.plt,aes(X,Y,color=Pred)) + 
+	geom_point(size=1,shape=15)+xlab("X-coordinate [m]")+ylab("Y-coordinate [m]")+
+	scale_colour_viridis_c(limits=c(3,24))+theme_bw()+
+	guides(size = guide_legend(order=2))+ggtitle("(a)")
+
+grid.arrange(grobs=list(plt.true,plt.mean,plt.unc), ncol = 2,common.legend = TRUE, legend="top")		
+```
+
+## Step 3. Group definition
+
+We first compute the matrix of pairwise HSIC-based dependence measures using the following function *pairwiseHSIC()*.
+
+```{r,message = FALSE, warning=FALSE}
+# HSIC
+pairwiseHSIC = function(x){
+C = matrix(0,ncol(x),ncol(x))
+p.mat = matrix(0,ncol(x),ncol(x))
+for (i in 1:ncol(x)){
+	print(i)
+	for (j in (1:ncol(x))[-i]){
+
+		x0 = x[,i]#matrix(x[,i],ncol=1)
+		y0 = x[,j]#matrix(x[,j],ncol=1)
+
+		if (is.numeric(x0) & is.numeric(y0)){
+		sensi <- sensiHSIC(model=NULL, X = data.frame(x0),
+					kernelX="rbf", 
+					paramX=NA,
+					kernelY="rbf", paramY=NA,
+					nboot = 0, conf = 0.95
+					)
+		}else if (is.factor(x0) & is.numeric(y0)){
+		sensi <- sensiHSIC(model=NULL, X = data.frame(x0),
+					kernelX="categ", 
+					paramX=NA,
+					kernelY="rbf", paramY=NA,
+					nboot = 0, conf = 0.95
+					)
+		}else if (is.factor(x0) & is.factor(y0)){
+		sensi <- sensiHSIC(model=NULL, X = data.frame(x0),
+					kernelX="categ", 
+					paramX=NA,
+					kernelY="categ", paramY=NA,
+					nboot = 0, conf = 0.95
+					)
+		}else if (is.numeric(x0) & is.factor(y0)){
+		sensi <- sensiHSIC(model=NULL, X = data.frame(x0),
+					kernelX="rbf", 
+					paramX=NA,
+					kernelY="categ", paramY=NA,
+					nboot = 0, conf = 0.95
+					)
+		}
+		ss = tell(sensi, y=data.frame(y0))
+		C[i,j] = as.numeric(unlist(ss$S["original"]))
+		test.perm <- testHSIC(ss, test.method="Gamma")
+		p.mat[i,j] <- as.numeric(unlist(test.perm$pval))
+	}
+}
+
+C = data.frame(C)
+p.mat = data.frame(p.mat)
+rownames(C) = colnames(C) = names(x)
+rownames(p.mat) = colnames(p.mat) = names(x)
+return(list(C=C,pval=p.mat))
+}
+```
+
+```{r,message = FALSE, warning=FALSE}
+C0 = pairwiseHSIC(x_train)
+C = C0$C
+P = C0$pval
+C = data.frame(C)
+rownames(C) = colnames(C) = names(x_train)
+corrplot(as.matrix(C), method = 'square', order = 'hclust', type = 'upper',addCoef.col ='black',
+		col=colorRampPalette(c("white","orange","red3"))(100), is.corr = FALSE)
+```
+
+On this basis, we then perform the grouping using the PAM algorithm with 3 groups.
+
+```{r,message = FALSE, warning=FALSE}
+DD = as.dist(1-C)
+kk = 3
+CLUS = pam(DD,kk,diss = TRUE,medoids = NULL)
+
+group_ts <- list()
+for (i in 1:kk){
+	group_ts[[i]] = names(x_train)[which(CLUS$clustering==i)]
+}
+
+names(group_ts) = c("bio2","bio5-10","bio13")
+print(group_ts)
+
+```
+
+## Step 4. Application of the group-based SHAP
+
+We apply the group-based SHAP to decompose the inter-quartile width at the grid points.
+
+```{r,message = FALSE, warning=FALSE}
+MY_predict_model <- function(x, newdata) {
+    qq = predict(x, data=newdata, type="quantiles",quantiles=c(0.25,0.75))
+    return(qq$predictions[,2]-qq$predictions[,1])
+}
+
+system.time(explanationQ <- shapr::explain(
+  model = model,
+  x_explain = x_test,
+  x_train = x_train,
+  approach = "ctree",
+  prediction_zero = 0,
+  predict_model = MY_predict_model,
+  get_model_specs = NULL,
+  group = group_ts,
+  n_batches = 1 
+)
+)
+```
+
+We then apply the group-based SHAP to decompose the mean prediction at the grid points.
+
+```{r,message = FALSE, warning=FALSE}
+MY_predict_model <- function(x, newdata) {
+  qq = predict(x, data=newdata)
+  return(qq$predictions)
+}
+
+system.time(explanationM <- shapr::explain(
+  model = modelM,
+  x_explain = x_test,
+  x_train = x_train,
+  approach = "ctree",
+  prediction_zero = 0,
+  predict_model = MY_predict_model,
+  get_model_specs = NULL,
+  group = group_ts,
+  n_batches = 1 
+)
+)
+```
+
+Example of decomposition for the first case.
+
+```{r,message = FALSE, warning=FALSE}
+case = 1
+plot(explanationQ,index_x_explain=case, plot_type = "waterfall")+ggtitle("Uncertainty decomposition")
+plot(explanationM,index_x_explain=case, plot_type = "waterfall")+ggtitle("Prediction decomposition")
+```
+
+
+## Further reading
+
+-   Rohmer et al. (2023) Insights into the prediction uncertainty of machine-learning-based digital soil mapping through a local attribution approach. egusphere-2024-323
